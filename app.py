@@ -1,123 +1,172 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-import pandas as pd
-from datetime import datetime
+# app.py  (Streamlit UI + Shunting Logic)
+import streamlit as st
+from datetime import datetime, timedelta
 from dateutil import parser
-from pathlib import Path
+import csv
+from io import StringIO
+from typing import List, Tuple
 
-CSV_PATH = Path("shunting_track_schedule.csv")   # <= same folder as app.py
-import os
-from pathlib import Path
+st.set_page_config(page_title="Shunting Slot Viewer", layout="wide")
 
-CSV_PATH = Path(os.environ.get("SHUNT_CSV", "shunting_track_schedule.csv"))
+CSV_COLUMNS = ["TrainID", "Track", "Arrival", "Departure"]
 
+# ---------- Utilities ----------
+def to_dt(v: str) -> datetime:
+    return parser.parse(str(v))
 
-# ----------------------- Utility Functions ------------------------
+def parse_csv_text(csv_text: str):
+    """Return list of rows dict with parsed datetimes."""
+    f = StringIO(csv_text)
+    reader = csv.DictReader(f)
+    rows = []
+    for r in reader:
+        try:
+            arrival = to_dt(r.get("Arrival") or r.get("arrival"))
+            departure = to_dt(r.get("Departure") or r.get("departure"))
+        except Exception:
+            continue
+        rows.append({
+            "TrainID": r.get("TrainID") or "",
+            "Track": (r.get("Track") or "").strip(),
+            "Arrival": arrival,
+            "Departure": departure
+        })
+    return rows
 
-def to_dt(value):
-    """Convert any datetime string into datetime object."""
-    return parser.parse(str(value))
+def rows_to_csv_text(rows):
+    out = StringIO()
+    writer = csv.DictWriter(out, fieldnames=CSV_COLUMNS)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({
+            "TrainID": r.get("TrainID",""),
+            "Track": r.get("Track",""),
+            "Arrival": r["Arrival"].isoformat(sep=" "),
+            "Departure": r["Departure"].isoformat(sep=" ")
+        })
+    return out.getvalue()
 
-def load_schedule():
-    """Load the shunting schedule CSV."""
-    if not CSV_PATH.exists():
-        return pd.DataFrame(columns=["TrainID", "Track", "Arrival", "Departure"])
-    df = pd.read_csv(CSV_PATH, parse_dates=["Arrival", "Departure"])
-    return df
-
-def merge_intervals(intervals):
-    """Merge overlapping intervals."""
+def merge_intervals(intervals: List[Tuple[datetime, datetime]]):
     if not intervals:
         return []
-    intervals = sorted(intervals, key=lambda x: x[0])
+    intervals.sort(key=lambda x: x[0])
     merged = [intervals[0]]
-    for start, end in intervals[1:]:
-        last_start, last_end = merged[-1]
-        if start <= last_end:
-            merged[-1] = (last_start, max(last_end, end))
+    for s,e in intervals[1:]:
+        last_s, last_e = merged[-1]
+        if s <= last_e:
+            merged[-1] = (last_s, max(last_e, e))
         else:
-            merged.append((start, end))
+            merged.append((s,e))
     return merged
 
-def get_busy_intervals(df, track, ws, we):
-    """Return busy intervals on a track."""
-    rows = df[df["Track"] == track]
+def get_busy_intervals(rows, track, ws, we):
     intervals = []
-    for _, r in rows.iterrows():
-        start = max(r["Arrival"], ws)
-        end = min(r["Departure"], we)
-        if start < end:
-            intervals.append((start, end))
+    for r in rows:
+        if (r["Track"] or "") != track:
+            continue
+        s = max(r["Arrival"], ws)
+        e = min(r["Departure"], we)
+        if s < e:
+            intervals.append((s,e))
     return merge_intervals(intervals)
 
 def get_free_intervals(busy, ws, we):
-    """Return free slots when track is not occupied."""
     free = []
     cursor = ws
-    for start, end in busy:
-        if cursor < start:
-            free.append((cursor, start))
-        cursor = max(cursor, end)
+    for s,e in busy:
+        if cursor < s:
+            free.append((cursor, s))
+        cursor = max(cursor, e)
     if cursor < we:
         free.append((cursor, we))
     return free
 
+def find_first_free_slot(free_intervals, required_minutes=10):
+    for s,e in free_intervals:
+        if (e - s).total_seconds() >= required_minutes * 60:
+            return (s, s + timedelta(minutes=required_minutes))
+    return None
 
-# ----------------------- FastAPI Models ------------------------
+# ---------- UI ----------
+st.title("🚆 Shunting Slot Viewer (Streamlit)")
 
-class SlotQuery(BaseModel):
-    window_start: str
-    window_end: str
-    track: Optional[str] = None
+col1, col2 = st.columns([1, 2])
 
+with col1:
+    st.header("Schedule CSV")
+    uploaded = st.file_uploader("Upload shunting_track_schedule.csv", type=["csv"])
 
-# ----------------------- FastAPI App ------------------------
+    if uploaded:
+        csv_bytes = uploaded.read()
+        csv_text = csv_bytes.decode("utf-8")
+        rows = parse_csv_text(csv_text)
+        st.success(f"Loaded {len(rows)} rows from uploaded CSV")
+    else:
+        st.info("No CSV uploaded. Load sample data if needed.")
+        if st.button("Load sample dataset"):
+            sample = """TrainID,Track,Arrival,Departure
+T001,Shunting_Neck,2025-12-01 05:10,2025-12-01 05:25
+T002,Stabling_Line_1,2025-12-01 05:05,2025-12-01 06:00
+T003,Inspection_Line_1,2025-12-01 05:30,2025-12-01 07:00
+T004,Stabling_Line_2,2025-12-01 05:45,2025-12-01 06:30
+T005,Shunting_Neck,2025-12-01 06:10,2025-12-01 06:40
+"""
+            rows = parse_csv_text(sample)
+            st.success("Sample data loaded")
 
-app = FastAPI(title="Shunting Slot Finder API")
+    if 'rows' not in locals():
+        rows = []
 
-@app.get("/")
-def home():
-    return {"message": "Shunting API is running 🚂"}
+    if rows:
+        if st.button("Download Current CSV"):
+            csv_out = rows_to_csv_text(rows)
+            st.download_button("Download CSV", csv_out, file_name="updated_shunting_schedule.csv")
 
+with col2:
+    st.header("Query Slots")
+    tracks = sorted({r["Track"] for r in rows})
 
-@app.get("/tracks")
-def list_tracks():
-    df = load_schedule()
-    tracks = sorted(df["Track"].dropna().unique().tolist())
-    return {"tracks": tracks}
+    if not tracks:
+        st.warning("No tracks found. Upload CSV or load sample.")
+    else:
+        track = st.selectbox("Select Track", tracks)
+        window_start = st.text_input("Window Start", "2025-12-01 05:00")
+        window_end = st.text_input("Window End", "2025-12-01 09:00")
+        required_minutes = st.number_input("Minimum Slot Duration (min)", 1, 300, 10)
 
+        if st.button("Compute Slots"):
+            ws = to_dt(window_start)
+            we = to_dt(window_end)
 
-@app.post("/slots")
-def compute_slots(query: SlotQuery):
-    df = load_schedule()
+            if ws >= we:
+                st.error("Window start must be before window end.")
+            else:
+                busy = get_busy_intervals(rows, track, ws, we)
+                free = get_free_intervals(busy, ws, we)
 
-    ws = to_dt(query.window_start)
-    we = to_dt(query.window_end)
+                st.subheader(f"Track: {track}")
 
-    if ws >= we:
-        raise HTTPException(status_code=400, detail="window_start must be before window_end")
+                st.write("### Busy Intervals")
+                if busy:
+                    for s, e in busy:
+                        st.write(f"- {s} → {e}")
+                else:
+                    st.write("- None")
 
-    tracks = [query.track] if query.track else sorted(df["Track"].dropna().unique().tolist())
+                st.write("### Free Intervals")
+                if free:
+                    for s, e in free:
+                        st.write(f"- {s} → {e}")
+                else:
+                    st.write("- None")
 
-    results = []
-
-    for track in tracks:
-        busy = get_busy_intervals(df, track, ws, we)
-        free = get_free_intervals(busy, ws, we)
-
-        results.append({
-            "track": track,
-            "busy": [(s.isoformat(), e.isoformat()) for s, e in busy],
-            "free": [(s.isoformat(), e.isoformat()) for s, e in free]
-        })
-
-    return results
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "csv_found": CSV_PATH.exists()
-    }
+                slot = find_first_free_slot(free, required_minutes)
+                if slot:
+                    s, e = slot
+                    st.success(f"First Free Slot: {s} → {e}")
+                    if st.button("Reserve Slot"):
+                        new_id = f"RESV_{len(rows)+1}"
+                        rows.append({"TrainID": new_id, "Track": track, "Arrival": s, "Departure": e})
+                        st.success(f"Reserved slot as TrainID {new_id}. Download CSV to save.")
+                else:
+                    st.info("No slot of required duration available.")
