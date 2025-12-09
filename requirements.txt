@@ -1,2 +1,7 @@
+<<<<<<< HEAD
 streamlit>=1.30.0
 python-dateutil>=2.8.2
+=======
+streamlit>=1.30.0
+python-dateutil>=2.8.2
+>>>>>>> 735c1b2defa3e429ebf442d1d512495824bd0401
